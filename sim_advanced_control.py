@@ -1,19 +1,12 @@
 """
 Advanced Prescribed-Time Adaptive Control for 3rd-Order Strict-Feedback System.
-Based on ADVANCED_REPORT.md.
-
-Features:
-1. Strict Prescribed-Time Scaling Function (k(t) -> inf as t -> T).
-2. Smooth Adaptive Dead-zone Inverse.
-3. Command Filter for derivative estimation.
-4. Projection Operator for parameter adaptation.
-5. Enhanced Koopman with Dead-zone features.
+Refactored for Comprehensive Experimentation.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass, field
-from typing import Callable, Tuple, List, Optional
+from typing import Callable, Tuple, List, Optional, Dict
 
 ##############################################################################
 #                               System & Utilities
@@ -26,25 +19,25 @@ class ThirdOrderSystem:
     dx2 = x3 + f2(x2) + d2
     dx3 = u(v)
     """
-    def __init__(self):
-        # Barrier constraints parameters (example usage in Barrier Lyapunov Function)
+    def __init__(self, disturbance_scale=1.0, extra_disturbance=False):
         self.kb1_base, self.kb2_base, self.kb3_base = 0.5, 0.4, 0.6
+        self.disturbance_scale = disturbance_scale
+        self.extra_disturbance = extra_disturbance
 
     def f1(self, x1):
-        # Unknown nonlinearity f1
         return np.sin(x1**2) * np.cos(x1)
 
     def f2(self, x2):
-        # Unknown nonlinearity f2
         return np.sin(x2) * (x2 + x2**2)
 
     def d1(self, t):
-        # Disturbance d1
-        return 0.01 * np.sin(t)
+        return self.disturbance_scale * 0.01 * np.sin(t)
 
     def d2(self, t):
-        # Disturbance d2
-        return 0.02 * np.sin(t)
+        val = self.disturbance_scale * 0.02 * np.sin(t)
+        if self.extra_disturbance and t > 2.0:
+            val += 0.5 # Step disturbance
+        return val
 
     def get_constraints(self, t):
         # Time-varying constraints for BLF
@@ -72,16 +65,23 @@ class ThirdOrderSystem:
         return np.array([dx1, dx2, dx3])
 
 class CommandFilter:
-    """Second-order Command Filter to estimate derivatives and smooth signals."""
-    def __init__(self, omega_n=50.0, zeta=0.8):
+    """Second-order Command Filter."""
+    def __init__(self, omega_n=40.0, zeta=0.8, enabled=True):
         self.omega_n = omega_n
         self.zeta = zeta
+        self.enabled = enabled
         self.x1 = 0.0 # Output alpha
         self.x2 = 0.0 # Output alpha_dot
 
     def step(self, u, dt):
-        # x1_dot = x2
-        # x2_dot = -2*zeta*wn*x2 - wn^2*(x1 - u)
+        if not self.enabled:
+            # Bypass filter: approximation needed outside or return u, 0 (if naive)
+            # Better approach: Caller handles bypass if they want finite diff.
+            # Here we just pass through if "disabled" effectively infinite bandwidth
+            self.x1 = u
+            self.x2 = 0.0 # No derivative info
+            return u, 0.0
+
         dx1 = self.x2
         dx2 = -2*self.zeta*self.omega_n*self.x2 - self.omega_n**2 * (self.x1 - u)
 
@@ -92,15 +92,17 @@ class CommandFilter:
 class StrictPrescribedTimeScaling:
     """
     Scaling function: mu(t) = (T / (T - t))^p
-    Ensures convergence by time T.
     """
-    def __init__(self, T, p=2.0, t_stop_ratio=0.99):
+    def __init__(self, T, p=2.0, t_stop_ratio=0.99, enabled=True):
         self.T = T
         self.p = p
-        # Stop scaling near T to avoid infinity in numerical simulation
         self.t_stop = T * t_stop_ratio
+        self.enabled = enabled
 
     def get_mu(self, t):
+        if not self.enabled:
+            return 1.0, 0.0
+
         t_eff = min(t, self.t_stop)
         denom = self.T - t_eff
         mu = (self.T / denom)**self.p
@@ -108,9 +110,8 @@ class StrictPrescribedTimeScaling:
         return mu, mu_dot
 
 class Projection:
-    """Parameter Projection Operator to keep estimates within bounds."""
     @staticmethod
-    def project(theta, d_theta, theta_min, theta_max, eps=0.1):
+    def project(theta, d_theta, theta_min, theta_max):
         if theta > theta_max and d_theta > 0:
             return 0.0
         if theta < theta_min and d_theta < 0:
@@ -118,43 +119,36 @@ class Projection:
         return d_theta
 
 ##############################################################################
-#                      Enhanced Koopman (With Deadzone Features)
+#                      Enhanced Koopman
 ##############################################################################
 
 class KoopmanEstimator:
-    """Data-driven estimator for system drift dynamics."""
     def __init__(self, n_obs=18, lambda_reg=1e-2):
         self.n_obs = n_obs
         self.lambda_reg = lambda_reg
         self.A_aug = None
 
-    def lift(self, x, u=0.0):
+    def lift(self, x):
         x1, x2, x3 = x
-        # Add ReLU features to capture deadzone-like behaviors in dynamics if embedded
         base = [x1, x2, x3, x1**2, x2**2, x3**2, x1*x2, x2*x3,
                 np.sin(x1), np.cos(x1), np.sin(x2), np.cos(x2), np.sin(x3),
-                np.maximum(0, x1), np.maximum(0, -x1)] # ReLU states
+                np.maximum(0, x1), np.maximum(0, -x1)]
         return np.array(base[:self.n_obs])
 
     def fit(self, X, Y, U):
-        """Fit the Koopman operator using Least Squares."""
         Psi_X = np.array([self.lift(xi) for xi in X])
         Psi_Y = np.array([self.lift(yi) for yi in Y])
         U_col = U.reshape(-1, 1)
-        # Phi = [Psi(X), U]
         Phi = np.hstack([Psi_X, U_col])
-        # Solve A_aug * Phi.T = Psi_Y.T  =>  Psi_Y = Phi * A_aug.T
-        # A_aug = (Phi.T * Phi + reg)^-1 * Phi.T * Psi_Y
         reg = self.lambda_reg * np.eye(Phi.shape[1])
         self.A_aug = np.linalg.solve(Phi.T @ Phi + reg, Phi.T @ Psi_Y).T
 
     def predict_drift(self, x, dt):
-        """Predict drift f(x) by setting u=0 (assuming linear input B*u structure)."""
         if self.A_aug is None: return np.zeros(3)
         psi = self.lift(x)
         phi = np.hstack([psi, [0.0]]) # u=0
         psi_next = self.A_aug @ phi
-        x_next = psi_next[:3] # Assuming first 3 observables are the states x1,x2,x3
+        x_next = psi_next[:3]
         return (x_next - x) / dt
 
 ##############################################################################
@@ -162,23 +156,52 @@ class KoopmanEstimator:
 ##############################################################################
 
 @dataclass
-class AdvancedController:
+class ControllerConfig:
     T_final: float = 5.0
+    p_scaling: float = 2.0
+    scaling_enabled: bool = True
+
+    cf_omega: float = 40.0
+    cf_enabled: bool = True
+
+    iblf_enabled: bool = True
+
+    adaptive_enabled: bool = True
+    deadzone_inverse_enabled: bool = True
+
+    koopman_enabled: bool = True
+
     k_gains: List[float] = field(default_factory=lambda: [5.0, 5.0, 5.0])
 
-    # Adaptive Parameters [m_hat, b_hat] for Inverse Deadzone
-    # u = m*v + b  => v = (u_des - b_hat) / m_hat
-    m_hat: float = 1.0
-    b_hat: float = 0.0
+class AdvancedController:
+    def __init__(self, config: ControllerConfig, koopman: Optional[KoopmanEstimator] = None):
+        self.cfg = config
+        self.koopman = koopman
 
-    koopman: Optional[KoopmanEstimator] = None
+        self.scaling = StrictPrescribedTimeScaling(
+            self.cfg.T_final,
+            p=self.cfg.p_scaling,
+            enabled=self.cfg.scaling_enabled
+        )
 
-    def __post_init__(self):
-        self.scaling = StrictPrescribedTimeScaling(self.T_final, p=2.0)
-        self.cf1 = CommandFilter(omega_n=40.0)
-        self.cf2 = CommandFilter(omega_n=40.0)
-        # Inverse Barrier Lyapunov Function (Simple form)
-        self.iblf = lambda x, k: x / ((k-0.01)**2 - x**2 + 1e-6)
+        self.cf1 = CommandFilter(omega_n=self.cfg.cf_omega, enabled=self.cfg.cf_enabled)
+        self.cf2 = CommandFilter(omega_n=self.cfg.cf_omega, enabled=self.cfg.cf_enabled)
+
+        self.m_hat = 1.0
+        self.b_hat = 0.0
+
+        # Helper for finite difference fallback if CF disabled
+        self.last_alpha1 = 0.0
+        self.last_alpha2 = 0.0
+        self.first_step = True
+
+    def iblf(self, x, k):
+        if not self.cfg.iblf_enabled:
+            return 0.0
+        # Barrier function: x / ((k-eps)^2 - x^2)
+        denom = (k - 0.01)**2 - x**2
+        if denom < 1e-4: denom = 1e-4 # Avoid division by zero
+        return x / denom
 
     def compute_control(self, system, x, t, dt):
         x1, x2, x3 = x
@@ -196,13 +219,24 @@ class AdvancedController:
         xi1 = mu * z1
         bar1 = self.iblf(x1, kb1)
 
-        # Drift estimation via Koopman
-        f_est = self.koopman.predict_drift(x, dt) if self.koopman else np.zeros(3)
-        f1_est = f_est[0] - x2 # f1 = dx1 - x2 (approx)
+        # Drift estimation
+        f_est = np.zeros(3)
+        if self.cfg.koopman_enabled and self.koopman:
+            f_est = self.koopman.predict_drift(x, dt)
 
-        # Virtual Control alpha1
-        alpha1_raw = (-self.k_gains[0]*xi1 - bar1)/mu_safe - (mu_dot/mu_safe)*z1 - f1_est + yd_dot
-        alpha1, d_alpha1 = self.cf1.step(alpha1_raw, dt)
+        f1_est = f_est[0] - x2
+
+        # Alpha1
+        alpha1_raw = (-self.cfg.k_gains[0]*xi1 - bar1)/mu_safe - (mu_dot/mu_safe)*z1 - f1_est + yd_dot
+
+        if self.cfg.cf_enabled:
+            alpha1, d_alpha1 = self.cf1.step(alpha1_raw, dt)
+        else:
+            # Simple finite difference fallback
+            alpha1 = alpha1_raw
+            if self.first_step: d_alpha1 = 0.0
+            else: d_alpha1 = (alpha1 - self.last_alpha1) / dt
+            self.last_alpha1 = alpha1
 
         # --- Step 2 ---
         z2 = x2 - alpha1
@@ -210,41 +244,68 @@ class AdvancedController:
         bar2 = self.iblf(x2, kb2)
         f2_est = f_est[1] - x3
 
-        # Virtual Control alpha2
-        alpha2_raw = (-self.k_gains[1]*xi2 - bar2)/mu_safe - (mu_dot/mu_safe)*z2 - f2_est + d_alpha1
-        alpha2, d_alpha2 = self.cf2.step(alpha2_raw, dt)
+        alpha2_raw = (-self.cfg.k_gains[1]*xi2 - bar2)/mu_safe - (mu_dot/mu_safe)*z2 - f2_est + d_alpha1
+
+        if self.cfg.cf_enabled:
+            alpha2, d_alpha2 = self.cf2.step(alpha2_raw, dt)
+        else:
+            alpha2 = alpha2_raw
+            if self.first_step: d_alpha2 = 0.0
+            else: d_alpha2 = (alpha2 - self.last_alpha2) / dt
+            self.last_alpha2 = alpha2
 
         # --- Step 3 ---
         z3 = x3 - alpha2
         xi3 = mu * z3
         bar3 = self.iblf(x3, kb3)
 
-        # Desired Control u_des
-        total_des = -self.k_gains[2]*xi3 - bar3 - mu_dot*z3 + mu*d_alpha2
+        total_des = -self.cfg.k_gains[2]*xi3 - bar3 - mu_dot*z3 + mu*d_alpha2
         u_des = total_des / mu_safe
 
-        # --- Smooth Dead-zone Inverse ---
-        # v = (u_des - b_hat) / m_hat
-        # Simplified symmetric adaptation for demonstration
-        v_cmd = (u_des - self.b_hat) / self.m_hat
+        # --- Inverse Dead-zone ---
+        if self.cfg.deadzone_inverse_enabled:
+            # v = (u_des - b_hat) / m_hat
+            v_cmd = (u_des - self.b_hat) / self.m_hat
+        else:
+            v_cmd = u_des
 
-        return v_cmd, {'xi3': xi3, 'u_des': u_des}
+        self.first_step = False
+
+        # Calculate actual actuator output (for debug)
+        u_act = system.deadzone(v_cmd)
+
+        debug = {
+            't': t,
+            'mu': mu, 'mu_dot': mu_dot,
+            'yd': yd, 'yd_dot': yd_dot,
+            'z': (z1, z2, z3),
+            'xi': (xi1, xi2, xi3),
+            'alpha1_info': (alpha1_raw, alpha1, d_alpha1),
+            'alpha2_info': (alpha2_raw, alpha2, d_alpha2),
+            'bar': (bar1, bar2, bar3),
+            'f_est': f_est,
+            'u_des': u_des,
+            'v_cmd': v_cmd,
+            'u_act': u_act,
+            'm_hat': self.m_hat,
+            'b_hat': self.b_hat
+        }
+
+        return v_cmd, debug
 
     def update_adaptation(self, debug, v_cmd, dt):
-        """Update adaptive parameters m_hat and b_hat."""
-        # Adaptation Law: dot_m = gamma * xi3 * v_cmd, dot_b = gamma * xi3
+        if not self.cfg.adaptive_enabled:
+            return
+
         gamma = 2.0
-        xi3 = debug['xi3']
-        # u_des = debug['u_des']
+        xi3 = debug['xi'][2]
 
         dm = gamma * xi3 * v_cmd
         db = gamma * xi3 * 1.0
 
-        # Projection to ensure parameters stay in feasible range
         self.m_hat += Projection.project(self.m_hat, dm, 0.5, 2.0) * dt
         self.b_hat += Projection.project(self.b_hat, db, -1.5, 1.5) * dt
 
-        # Safety clamp
         self.m_hat = max(0.5, self.m_hat)
 
 
@@ -258,7 +319,6 @@ class DataGenerator:
         self.dt = dt
 
     def generate(self, num_traj=50, steps=300):
-        """Generate random trajectories for Koopman training."""
         X, Y, U = [], [], []
         for _ in range(num_traj):
             x = np.random.uniform(-0.4, 0.4, 3)
@@ -268,17 +328,14 @@ class DataGenerator:
 
             for step in range(steps):
                 t = step * self.dt
-                # Rich excitation input
                 v = 2.0*np.sin(0.5*t+phase) + 1.5*np.sin(1.2*t) + np.random.randn()
                 v = float(np.clip(v, -8, 8))
-
                 dx = self.system.dynamics(t, x, v)
                 x_next = x + dx * self.dt
 
                 if np.any(np.abs(x_next) > 3.0):
                     valid = False
                     break
-
                 traj_X.append(x.copy())
                 traj_Y.append(x_next.copy())
                 traj_U.append(v)
@@ -291,73 +348,63 @@ class DataGenerator:
 
         return np.array(X), np.array(Y), np.array(U)
 
-def run_advanced_simulation():
+def run_simulation(config: ControllerConfig, sys_args: Dict = None):
+    if sys_args is None: sys_args = {}
     dt = 0.01
-    times = np.arange(0, 5.0, dt)
-    sys = ThirdOrderSystem()
+    times = np.arange(0, config.T_final, dt)
 
-    # Train Koopman with Real Data
-    print("Generating Data & Training Koopman...")
-    gen = DataGenerator(sys, dt)
-    X, Y, U = gen.generate(num_traj=50, steps=300)
+    # Setup System
+    sys = ThirdOrderSystem(**sys_args)
 
-    est = KoopmanEstimator()
-    est.fit(X, Y, U)
-    print("Koopman Fitted.")
+    # Train Koopman (always needed if enabled in config)
+    est = None
+    if config.koopman_enabled:
+        # Generate generic training data
+        gen_sys = ThirdOrderSystem() # Standard system for training
+        gen = DataGenerator(gen_sys, dt)
+        X, Y, U = gen.generate(num_traj=30, steps=200) # Reduced for speed
+        est = KoopmanEstimator()
+        est.fit(X, Y, U)
 
-    ctrl = AdvancedController(koopman=est)
+    ctrl = AdvancedController(config, koopman=est)
 
+    # Initial Condition
     x = np.array([0.1, 0.1, 0.1])
-    logs = {'x': [], 'v': [], 'm': [], 'b': []}
+    if sys_args.get('extra_disturbance', False): # Use specific IC for stress tests if needed
+         pass
+
+    # Logging
+    logs = {k: [] for k in ['t', 'x', 'mu', 'xi', 'z', 'u_des', 'v_cmd', 'u_act', 'm_hat', 'b_hat']}
 
     for t in times:
         v_cmd, debug = ctrl.compute_control(sys, x, t, dt)
-        v_cmd = float(np.clip(v_cmd, -20, 20))
+        v_cmd = float(np.clip(v_cmd, -20, 20)) # Safety clip
 
         ctrl.update_adaptation(debug, v_cmd, dt)
 
         dx = sys.dynamics(t, x, v_cmd)
         x += dx * dt
 
-        logs['x'].append(x)
-        logs['v'].append(v_cmd)
-        logs['m'].append(ctrl.m_hat)
-        logs['b'].append(ctrl.b_hat)
+        # Store Data
+        logs['t'].append(t)
+        logs['x'].append(x.copy())
+        logs['mu'].append(debug['mu'])
+        logs['xi'].append(debug['xi'])
+        logs['z'].append(debug['z'])
+        logs['u_des'].append(debug['u_des'])
+        logs['v_cmd'].append(debug['v_cmd'])
+        logs['u_act'].append(debug['u_act'])
+        logs['m_hat'].append(debug['m_hat'])
+        logs['b_hat'].append(debug['b_hat'])
 
-    # Plotting
-    logs['x'] = np.array(logs['x'])
-    plt.figure(figsize=(12, 8))
+    # Convert to arrays
+    for k in logs:
+        logs[k] = np.array(logs[k])
 
-    plt.subplot(2,2,1)
-    plt.plot(times, logs['x'][:,0], label='x1')
-    plt.plot(times, 0.3*np.sin(times), 'k--', label='ref')
-    plt.title('Tracking x1 (Prescribed Time)')
-    plt.xlabel('Time (s)')
-    plt.ylabel('x1')
-    plt.legend()
-
-    plt.subplot(2,2,2)
-    plt.plot(times, logs['v'])
-    plt.title('Control Input v')
-    plt.xlabel('Time (s)')
-
-    plt.subplot(2,2,3)
-    plt.plot(times, logs['m'], label='m_hat')
-    plt.plot(times, logs['b'], label='b_hat')
-    plt.title('Adaptive Dead-zone Parameters')
-    plt.xlabel('Time (s)')
-    plt.legend()
-
-    plt.subplot(2,2,4)
-    # Plot error
-    plt.plot(times, logs['x'][:,0] - 0.3*np.sin(times), 'r', label='Error x1')
-    plt.title('Tracking Error')
-    plt.xlabel('Time (s)')
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig('advanced_control_results.png')
-    print("Simulation Complete. Saved plot to 'advanced_control_results.png'.")
+    return logs
 
 if __name__ == '__main__':
-    run_advanced_simulation()
+    # Quick test run
+    cfg = ControllerConfig()
+    logs = run_simulation(cfg)
+    print("Test simulation complete. Data points:", len(logs['t']))
