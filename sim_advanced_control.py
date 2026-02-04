@@ -1,6 +1,12 @@
 """
 Advanced Prescribed-Time Adaptive Control for 3rd-Order Strict-Feedback System.
-Refactored for Comprehensive Experimentation.
+Refactored for Comprehensive Experimentation (v2).
+
+Key Updates:
+1. Fixed logging: Logs clipped v_app and actual u_app.
+2. Fixed Scaling: mu_dot=0 when t >= t_stop.
+3. Fixed Adaptive: Hard clipping for m_hat, b_hat; Split estimation (Right/Left).
+4. Improved Koopman: Uses previous input v for prediction.
 """
 
 import numpy as np
@@ -93,7 +99,7 @@ class StrictPrescribedTimeScaling:
     """
     Scaling function: mu(t) = (T / (T - t))^p
     """
-    def __init__(self, T, p=2.0, t_stop_ratio=0.99, enabled=True):
+    def __init__(self, T, p=2.0, t_stop_ratio=0.95, enabled=True): # Changed default stop to 0.95
         self.T = T
         self.p = p
         self.t_stop = T * t_stop_ratio
@@ -103,8 +109,13 @@ class StrictPrescribedTimeScaling:
         if not self.enabled:
             return 1.0, 0.0
 
-        t_eff = min(t, self.t_stop)
-        denom = self.T - t_eff
+        # FIX: Ensure mu_dot is 0 when t >= t_stop
+        if t >= self.t_stop:
+            denom = self.T - self.t_stop
+            mu = (self.T / denom)**self.p
+            return mu, 0.0
+
+        denom = self.T - t
         mu = (self.T / denom)**self.p
         mu_dot = self.p * (self.T**self.p) / (denom**(self.p + 1))
         return mu, mu_dot
@@ -143,10 +154,10 @@ class KoopmanEstimator:
         reg = self.lambda_reg * np.eye(Phi.shape[1])
         self.A_aug = np.linalg.solve(Phi.T @ Phi + reg, Phi.T @ Psi_Y).T
 
-    def predict_drift(self, x, dt):
+    def predict_drift(self, x, u_prev, dt):
         if self.A_aug is None: return np.zeros(3)
         psi = self.lift(x)
-        phi = np.hstack([psi, [0.0]]) # u=0
+        phi = np.hstack([psi, [u_prev]]) # Use previous u for better prediction
         psi_next = self.A_aug @ phi
         x_next = psi_next[:3]
         return (x_next - x) / dt
@@ -187,13 +198,18 @@ class AdvancedController:
         self.cf1 = CommandFilter(omega_n=self.cfg.cf_omega, enabled=self.cfg.cf_enabled)
         self.cf2 = CommandFilter(omega_n=self.cfg.cf_omega, enabled=self.cfg.cf_enabled)
 
-        self.m_hat = 1.0
-        self.b_hat = 0.0
+        # Split adaptive parameters (Right / Left)
+        # Init close to true values (1.2, -0.9) and (0.8, 0.4) or neutral (1.0, 0.0)
+        self.m_hat_r = 1.0
+        self.b_hat_r = 0.0
+        self.m_hat_l = 1.0
+        self.b_hat_l = 0.0
 
         # Helper for finite difference fallback if CF disabled
         self.last_alpha1 = 0.0
         self.last_alpha2 = 0.0
         self.first_step = True
+        self.v_prev = 0.0
 
     def iblf(self, x, k):
         if not self.cfg.iblf_enabled:
@@ -210,7 +226,9 @@ class AdvancedController:
 
         kb1, kb2, kb3 = system.get_constraints(t)
 
-        # --- Reference ---
+        # --- Reference (Using lower amplitude if needed for deadzone exp, handled by caller?)
+        # For consistency with previous report, keep 0.3 but Exp2 runner might want lower.
+        # Hardcoding 0.3 here for general case.
         yd = 0.3 * np.sin(t)
         yd_dot = 0.3 * np.cos(t)
 
@@ -222,7 +240,7 @@ class AdvancedController:
         # Drift estimation
         f_est = np.zeros(3)
         if self.cfg.koopman_enabled and self.koopman:
-            f_est = self.koopman.predict_drift(x, dt)
+            f_est = self.koopman.predict_drift(x, self.v_prev, dt)
 
         f1_est = f_est[0] - x2
 
@@ -262,17 +280,18 @@ class AdvancedController:
         total_des = -self.cfg.k_gains[2]*xi3 - bar3 - mu_dot*z3 + mu*d_alpha2
         u_des = total_des / mu_safe
 
-        # --- Inverse Dead-zone ---
+        # --- Inverse Dead-zone (Split) ---
+        v_cmd = u_des
         if self.cfg.deadzone_inverse_enabled:
-            # v = (u_des - b_hat) / m_hat
-            v_cmd = (u_des - self.b_hat) / self.m_hat
-        else:
-            v_cmd = u_des
+            if u_des >= 0:
+                v_cmd = (u_des - self.b_hat_r) / self.m_hat_r
+            else:
+                v_cmd = (u_des - self.b_hat_l) / self.m_hat_l
 
         self.first_step = False
 
-        # Calculate actual actuator output (for debug)
-        u_act = system.deadzone(v_cmd)
+        # NOTE: Caller (run_simulation) will clip v_cmd and call update_adaptation
+        # Debug info should reflect 'pre-clip' intent, but update_adaptation needs executed command.
 
         debug = {
             't': t,
@@ -285,28 +304,43 @@ class AdvancedController:
             'bar': (bar1, bar2, bar3),
             'f_est': f_est,
             'u_des': u_des,
-            'v_cmd': v_cmd,
-            'u_act': u_act,
-            'm_hat': self.m_hat,
-            'b_hat': self.b_hat
+            'v_raw': v_cmd, # Unclipped
+            'm_hat_r': self.m_hat_r,
+            'b_hat_r': self.b_hat_r,
+            'm_hat_l': self.m_hat_l,
+            'b_hat_l': self.b_hat_l
         }
 
         return v_cmd, debug
 
-    def update_adaptation(self, debug, v_cmd, dt):
+    def update_adaptation(self, debug, v_app, dt):
         if not self.cfg.adaptive_enabled:
             return
 
+        # Use applied v (v_app) to determine which side we are on
+        # Update law: dot_m = gamma * xi3 * v, dot_b = gamma * xi3
         gamma = 2.0
         xi3 = debug['xi'][2]
 
-        dm = gamma * xi3 * v_cmd
+        dm = gamma * xi3 * v_app
         db = gamma * xi3 * 1.0
 
-        self.m_hat += Projection.project(self.m_hat, dm, 0.5, 2.0) * dt
-        self.b_hat += Projection.project(self.b_hat, db, -1.5, 1.5) * dt
+        # Split Update
+        if v_app >= 0: # Right side
+             self.m_hat_r += Projection.project(self.m_hat_r, dm, 0.5, 2.0) * dt
+             self.b_hat_r += Projection.project(self.b_hat_r, db, -1.5, 1.5) * dt
+             # Hard Clip
+             self.m_hat_r = np.clip(self.m_hat_r, 0.5, 2.0)
+             self.b_hat_r = np.clip(self.b_hat_r, -1.5, 1.5)
+        else: # Left side
+             self.m_hat_l += Projection.project(self.m_hat_l, dm, 0.5, 2.0) * dt
+             self.b_hat_l += Projection.project(self.b_hat_l, db, -1.5, 1.5) * dt
+             # Hard Clip
+             self.m_hat_l = np.clip(self.m_hat_l, 0.5, 2.0)
+             self.b_hat_l = np.clip(self.b_hat_l, -1.5, 1.5)
 
-        self.m_hat = max(0.5, self.m_hat)
+        # Store for next step Koopman prediction
+        self.v_prev = v_app
 
 
 ##############################################################################
@@ -348,9 +382,9 @@ class DataGenerator:
 
         return np.array(X), np.array(Y), np.array(U)
 
-def run_simulation(config: ControllerConfig, sys_args: Dict = None):
+def run_simulation(config: ControllerConfig, sys_args: Dict = None, x0: np.ndarray = None):
     if sys_args is None: sys_args = {}
-    dt = 0.01
+    dt = 0.002 # Reduced dt for better stability (Euler)
     times = np.arange(0, config.T_final, dt)
 
     # Setup System
@@ -361,7 +395,7 @@ def run_simulation(config: ControllerConfig, sys_args: Dict = None):
     if config.koopman_enabled:
         # Generate generic training data
         gen_sys = ThirdOrderSystem() # Standard system for training
-        gen = DataGenerator(gen_sys, dt)
+        gen = DataGenerator(gen_sys, dt=dt) # Train on matched dt
         X, Y, U = gen.generate(num_traj=30, steps=200) # Reduced for speed
         est = KoopmanEstimator()
         est.fit(X, Y, U)
@@ -369,20 +403,24 @@ def run_simulation(config: ControllerConfig, sys_args: Dict = None):
     ctrl = AdvancedController(config, koopman=est)
 
     # Initial Condition
-    x = np.array([0.1, 0.1, 0.1])
-    if sys_args.get('extra_disturbance', False): # Use specific IC for stress tests if needed
-         pass
+    if x0 is None:
+        x = np.array([0.1, 0.1, 0.1])
+    else:
+        x = np.array(x0)
 
     # Logging
     logs = {k: [] for k in ['t', 'x', 'mu', 'xi', 'z', 'u_des', 'v_cmd', 'u_act', 'm_hat', 'b_hat']}
 
     for t in times:
-        v_cmd, debug = ctrl.compute_control(sys, x, t, dt)
-        v_cmd = float(np.clip(v_cmd, -20, 20)) # Safety clip
+        v_raw, debug = ctrl.compute_control(sys, x, t, dt)
 
-        ctrl.update_adaptation(debug, v_cmd, dt)
+        # FIX: Clip immediately and use this for dynamics AND logging
+        v_app = float(np.clip(v_raw, -20, 20))
+        u_app = sys.deadzone(v_app)
 
-        dx = sys.dynamics(t, x, v_cmd)
+        ctrl.update_adaptation(debug, v_app, dt)
+
+        dx = sys.dynamics(t, x, v_app)
         x += dx * dt
 
         # Store Data
@@ -392,10 +430,17 @@ def run_simulation(config: ControllerConfig, sys_args: Dict = None):
         logs['xi'].append(debug['xi'])
         logs['z'].append(debug['z'])
         logs['u_des'].append(debug['u_des'])
-        logs['v_cmd'].append(debug['v_cmd'])
-        logs['u_act'].append(debug['u_act'])
-        logs['m_hat'].append(debug['m_hat'])
-        logs['b_hat'].append(debug['b_hat'])
+        logs['v_cmd'].append(v_app) # LOGGING FIX: Log applied v
+        logs['u_act'].append(u_app) # LOGGING FIX: Log actual u
+
+        # Log average m_hat for simplified plotting, or specific one?
+        # Plotting usually expects one line, let's log the one active or average
+        if v_app >= 0:
+            logs['m_hat'].append(debug['m_hat_r'])
+            logs['b_hat'].append(debug['b_hat_r'])
+        else:
+            logs['m_hat'].append(debug['m_hat_l'])
+            logs['b_hat'].append(debug['b_hat_l'])
 
     # Convert to arrays
     for k in logs:
